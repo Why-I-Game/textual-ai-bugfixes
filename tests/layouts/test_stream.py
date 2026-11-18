@@ -7,7 +7,7 @@ async def test_stream_layout_height_respects_horizontal_margin():
     """A widget with a horizontal margin in a stream layout must be measured at the
     width it is placed with, or wrapped text loses its last line.
 
-    Regression test for https://github.com/Textualize/textual/issues/<number>
+    Regression test for https://github.com/Textualize/textual/issues/6794
     """
 
     class StreamMarginApp(App):
