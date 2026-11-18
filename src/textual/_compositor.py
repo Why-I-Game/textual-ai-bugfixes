@@ -278,11 +278,74 @@ class ChopsUpdate(CompositorUpdate):
         yield from ()
 
 
+class _SubtreeRecord:
+    """What is gathered while the subtree of one off-screen widget is arranged."""
+
+    __slots__ = ("nodes", "scrollables", "chrome", "uncacheable")
+
+    def __init__(self) -> None:
+        # Every widget the arrangement visited below (and including) the subtree root
+        self.nodes: list[Widget] = []
+        # The visited widgets that are scrollable (their scroll state is part of the result)
+        self.scrollables: list[Widget] = []
+        # Scrollbar widgets: their `virtual_region` is a screen region, not a relative one
+        self.chrome: set[Widget] = set()
+        # Set when the result is not a plain shift of the layout (see `_arrange_root`)
+        self.uncacheable = False
+
+
+class _SubtreeEntry(NamedTuple):
+    """The arrangement of an off-screen subtree, kept for the next full reflow."""
+
+    key: tuple
+    origin: Offset  # Screen offset of the subtree root when the entry was made
+    entries: list  # (widget, MapGeometry) pairs, in map order
+    chrome: frozenset
+    bbox: Region  # Union of the entry regions
+    widgets: list
+    invisible: list
+    nodes: list
+    nodes_updates: int
+    layout_updates: list
+    mounted: list
+    styles_keys: list
+    scrollables: list
+    scroll_state: list
+
+
+def _layout_state(nodes: list[Widget]) -> tuple[list, list, list]:
+    """Everything about `nodes` that decides their arrangement, apart from scrolling."""
+    return (
+        [node._layout_updates for node in nodes],
+        [node._is_mounted for node in nodes],
+        [node.styles._cache_key for node in nodes],
+    )
+
+
+def _scroll_state(scrollables: list[Widget]) -> list[tuple]:
+    """The scroll related state of `scrollables` that decides their arrangement."""
+    return [
+        (
+            getattr(node, "_reactive_scroll_x", 0.0),
+            getattr(node, "_reactive_scroll_y", 0.0),
+            getattr(node, "_reactive_show_vertical_scrollbar", False),
+            getattr(node, "_reactive_show_horizontal_scrollbar", False),
+            getattr(node, "_reactive_loading", False),
+            node._anchored,
+            node._anchor_released,
+            node._cover_widget is None,
+        )
+        for node in scrollables
+    ]
+
+
 @rich.repr.auto(angular=True)
 class Compositor:
     """Responsible for storing information regarding the relative positions of Widgets and rendering them."""
 
     def __init__(self) -> None:
+        # Arrangements of off-screen subtrees from the last full reflow (see `_arrange_root`)
+        self._subtree_cache: dict[Widget, _SubtreeEntry] = {}
         # A mapping of Widget on to its "render location" (absolute position / depth)
         self._full_map: CompositorMap = {}
         self._full_map_invalidated = True
@@ -319,6 +382,7 @@ class Compositor:
         self.widgets.clear()
         self._visible_widgets = None
         self._layers_visible = None
+        self._subtree_cache = {}
 
     @classmethod
     def _regions_to_spans(
@@ -545,7 +609,14 @@ class Compositor:
 
         no_clip = size.region
 
-        def add_widget(
+        # A full arrangement reuses the result for a widget that lies completely outside
+        # its container's clip region (scrolled out of view) when nothing below it changed.
+        use_cache = not visible_only
+        old_cache = self._subtree_cache if use_cache else {}
+        new_cache: dict[Widget, _SubtreeEntry] = {}
+        recording: _SubtreeRecord | None = None
+
+        def add_widget_body(
             widget: Widget,
             virtual_region: Region,
             region: Region,
@@ -556,7 +627,8 @@ class Compositor:
             dock_gutter: Spacing,
             _MapGeometry: type[MapGeometry] = MapGeometry,
         ) -> None:
-            """Called recursively to place a widget and its children in the map.
+            """Called recursively (through `add_widget`) to place a widget and its children
+            in the map.
 
             Args:
                 widget: The widget to add.
@@ -586,6 +658,13 @@ class Compositor:
 
             # Widgets with scrollbars (containers or scroll view) require additional processing
             if widget.is_scrollable:
+                if recording is not None:
+                    recording.scrollables.append(widget)
+                    if widget._cover_widget is not None or (
+                        widget._anchored and not widget._anchor_released
+                    ):
+                        # These change the widget's own scroll state while arranging
+                        recording.uncacheable = True
                 # The region that contains the content (container region minus scrollbars)
                 child_region = (
                     container_region
@@ -630,10 +709,17 @@ class Compositor:
                     placement_offset = container_region.offset
                     placement_scroll_offset = placement_offset - widget.scroll_offset
 
+                    unprocessed = placements
                     placements = [
                         placement.process_offset(size.region, placement_scroll_offset)
                         for placement in placements
                     ]
+                    if recording is not None and any(
+                        before is not after
+                        for before, after in zip(unprocessed, placements)
+                    ):
+                        # Absolute offsets and constrain rules depend on the screen
+                        recording.uncacheable = True
 
                     layers_to_index = {
                         layer_name: index
@@ -664,6 +750,9 @@ class Compositor:
                         overlay,
                         absolute,
                     ) in reversed(placements):
+                        if recording is not None and (overlay or absolute):
+                            # Their regions depend on the screen, not just on this widget
+                            recording.uncacheable = True
                         layer_index = get_layer_index(sub_widget.layer, 0)
                         # Combine regions with children to calculate the "virtual size"
                         if fixed:
@@ -691,6 +780,8 @@ class Compositor:
                         layer_order -= 1
                 else:
                     if widget._anchored and not widget._anchor_released:
+                        if recording is not None:
+                            recording.uncacheable = True
                         new_scroll_y = widget.virtual_size.height - (
                             widget.container_size.height
                             - widget.scrollbar_size_horizontal
@@ -708,6 +799,8 @@ class Compositor:
                         for chrome_widget, chrome_region in widget._arrange_scrollbars(
                             container_region
                         ):
+                            if recording is not None:
+                                recording.chrome.add(chrome_widget)
                             map[chrome_widget] = _MapGeometry(
                                 chrome_region,
                                 order,
@@ -740,6 +833,202 @@ class Compositor:
                     dock_gutter,
                 )
 
+        def add_widget(
+            widget: Widget,
+            virtual_region: Region,
+            region: Region,
+            order: tuple[tuple[int, int, int], ...],
+            layer_order: int,
+            clip: Region,
+            visible: bool,
+            dock_gutter: Spacing,
+        ) -> None:
+            """Place a widget and its children in the map, reusing the result of the last
+            full arrangement for a subtree that is scrolled out of view and unchanged.
+
+            The result is the same as from `add_widget_body`: a reused subtree is moved by
+            the shift of its root. The clip regions of its entries may differ from a fresh
+            result, but only where the region lies outside the clip anyway, which nothing
+            tells apart (visibility tests intersect the region with the clip).
+            """
+            nonlocal map, widgets, add_new_widget
+            nonlocal invisible_widgets, add_new_invisible_widget, recording
+
+            if recording is not None:
+                recording.nodes.append(widget)
+                add_widget_body(
+                    widget,
+                    virtual_region,
+                    region,
+                    order,
+                    layer_order,
+                    clip,
+                    visible,
+                    dock_gutter,
+                )
+                return
+
+            if (
+                not use_cache
+                or not widget._is_mounted
+                or not widget._nodes
+                or region.overlaps(clip)
+            ):
+                add_widget_body(
+                    widget,
+                    virtual_region,
+                    region,
+                    order,
+                    layer_order,
+                    clip,
+                    visible,
+                    dock_gutter,
+                )
+                return
+
+            key = (
+                region.size,
+                virtual_region,
+                order,
+                layer_order,
+                visible,
+                dock_gutter,
+                size,
+            )
+            entry = old_cache.get(widget)
+            if (
+                entry is not None
+                and entry.key == key
+                and self._subtree_unchanged(entry, widget)
+            ):
+                dx = region.x - entry.origin.x
+                dy = region.y - entry.origin.y
+                bbox_x, bbox_y, bbox_width, bbox_height = entry.bbox
+                if not Region(
+                    bbox_x + dx, bbox_y + dy, bbox_width, bbox_height
+                ).overlaps(clip):
+                    if dx or dy:
+                        # Move every entry by the shift of the subtree root (building the
+                        # map tuples directly, as this runs for thousands of widgets)
+                        chrome = entry.chrome
+                        new_tuple = tuple.__new__
+                        for sub_widget, geometry in entry.entries:
+                            (
+                                sub_region,
+                                sub_order,
+                                sub_clip,
+                                virtual_size,
+                                container_size,
+                                sub_virtual_region,
+                                sub_dock_gutter,
+                            ) = geometry
+                            sub_x, sub_y, sub_width, sub_height = sub_region
+                            sub_region = Region(
+                                sub_x + dx, sub_y + dy, sub_width, sub_height
+                            )
+                            if sub_widget in chrome:
+                                sub_virtual_region = sub_region
+                            map[sub_widget] = new_tuple(
+                                MapGeometry,
+                                (
+                                    sub_region,
+                                    sub_order,
+                                    sub_clip,
+                                    virtual_size,
+                                    container_size,
+                                    sub_virtual_region,
+                                    sub_dock_gutter,
+                                ),
+                            )
+                    else:
+                        map.update(entry.entries)
+                    widgets.update(entry.widgets)
+                    invisible_widgets.update(entry.invisible)
+                    new_cache[widget] = entry
+                    return
+
+            # Arrange the subtree into private collections, then merge them in
+            record = _SubtreeRecord()
+            record.nodes.append(widget)
+            saved = (
+                map,
+                widgets,
+                add_new_widget,
+                invisible_widgets,
+                add_new_invisible_widget,
+            )
+            map = {}
+            widgets = set()
+            add_new_widget = widgets.add
+            invisible_widgets = set()
+            add_new_invisible_widget = invisible_widgets.add
+            recording = record
+            try:
+                add_widget_body(
+                    widget,
+                    virtual_region,
+                    region,
+                    order,
+                    layer_order,
+                    clip,
+                    visible,
+                    dock_gutter,
+                )
+            finally:
+                recording = None
+                sub_map = map
+                sub_widgets = widgets
+                sub_invisible = invisible_widgets
+                (
+                    map,
+                    widgets,
+                    add_new_widget,
+                    invisible_widgets,
+                    add_new_invisible_widget,
+                ) = saved
+                map.update(sub_map)
+                widgets.update(sub_widgets)
+                invisible_widgets.update(sub_invisible)
+
+            if record.uncacheable or not sub_map:
+                return
+            nodes = record.nodes
+            if any([node._layout_required for node in nodes]):
+                return
+            x1 = y1 = x2 = y2 = None
+            for geometry in sub_map.values():
+                geometry_x, geometry_y, geometry_width, geometry_height = geometry.region
+                if x1 is None:
+                    x1 = geometry_x
+                    y1 = geometry_y
+                    x2 = geometry_x + geometry_width
+                    y2 = geometry_y + geometry_height
+                else:
+                    x1 = min(x1, geometry_x)
+                    y1 = min(y1, geometry_y)
+                    x2 = max(x2, geometry_x + geometry_width)
+                    y2 = max(y2, geometry_y + geometry_height)
+            bbox = Region(x1, y1, x2 - x1, y2 - y1)
+            if bbox.overlaps(clip):
+                return
+            layout_updates, mounted, styles_keys = _layout_state(nodes)
+            new_cache[widget] = _SubtreeEntry(
+                key,
+                region.offset,
+                list(sub_map.items()),
+                frozenset(record.chrome),
+                bbox,
+                list(sub_widgets),
+                list(sub_invisible),
+                nodes,
+                widget._nodes._updates,
+                layout_updates,
+                mounted,
+                styles_keys,
+                record.scrollables,
+                _scroll_state(record.scrollables),
+            )
+
         # Add top level (root) widget
         add_widget(
             root,
@@ -752,7 +1041,36 @@ class Compositor:
             NULL_SPACING,
         )
         widgets -= invisible_widgets
+        if use_cache:
+            self._subtree_cache = new_cache
         return map, widgets
+
+    @staticmethod
+    def _subtree_unchanged(entry: _SubtreeEntry, widget: Widget) -> bool:
+        """Check that nothing which decides the arrangement below `widget` has changed
+        since `entry` was made.
+
+        Args:
+            entry: A cached arrangement of the subtree.
+            widget: The widget at the root of the subtree.
+
+        Returns:
+            `True` if the cached arrangement is still the arrangement of the subtree.
+        """
+        if entry.nodes_updates != widget._nodes._updates:
+            # Anything added, removed or shown or hidden below changes this (and the
+            # counters of every ancestor)
+            return False
+        nodes = entry.nodes
+        if any([node._layout_required for node in nodes]):
+            return False
+        layout_updates, mounted, styles_keys = _layout_state(nodes)
+        return (
+            layout_updates == entry.layout_updates
+            and mounted == entry.mounted
+            and styles_keys == entry.styles_keys
+            and _scroll_state(entry.scrollables) == entry.scroll_state
+        )
 
     @property
     def layers(self) -> list[tuple[Widget, MapGeometry]]:
