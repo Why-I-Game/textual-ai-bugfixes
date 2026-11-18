@@ -1495,9 +1495,35 @@ class Widget(DOMNode):
                     if child._has_order_style or child._has_odd_or_even:
                         child.update_node_styles()
             else:
-                for child in children:
-                    if child._has_order_style:
+                # Added at the end: of the earlier siblings, only the old last child
+                # and the old last of each type can change (`:last-child`,
+                # `:last-of-type`), so restyle those and the new widgets only.
+                new_widgets = set(mounted)
+                new_types = {type(widget) for widget in mounted}
+                later_types: set[type] = set()
+                is_old_last_child = True
+                for child in reversed(children):
+                    if child in new_widgets:
+                        if child._has_order_style:
+                            child.update_node_styles()
+                        continue
+                    child_type = type(child)
+                    if child._has_order_style and (
+                        is_old_last_child
+                        or (
+                            not any(
+                                issubclass(later_type, child_type)
+                                for later_type in later_types
+                            )
+                            and any(
+                                issubclass(new_type, child_type)
+                                for new_type in new_types
+                            )
+                        )
+                    ):
                         child.update_node_styles()
+                    is_old_last_child = False
+                    later_types.add(child_type)
 
         self.call_later(update_styles, self.displayed_children)
         await_mount = AwaitMount(self, mounted)
