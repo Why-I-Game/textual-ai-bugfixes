@@ -616,7 +616,12 @@ class Compositor:
                         )
                         widget.set_reactive(Widget.scroll_y, new_scroll_y)
                         widget.set_reactive(Widget.scroll_target_y, new_scroll_y)
-                        widget.vertical_scrollbar._reactive_position = new_scroll_y
+                        scrollbar = widget.vertical_scrollbar
+                        if scrollbar._reactive_position != new_scroll_y:
+                            scrollbar._reactive_position = new_scroll_y
+                            # Set without the watcher, so ask for the repaint here;
+                            # else the thumb stays where it was drawn before.
+                            scrollbar.refresh()
 
                     if visible_only:
                         placements = arrange_result.get_visible_placements(
