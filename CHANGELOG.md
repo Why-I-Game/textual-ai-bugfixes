@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ### Changed
 
 - Dropped support for Python 3.9 https://github.com/Textualize/textual/pull/6756
+- `MarkdownStream` now rests after each append, so the app can lay out and handle input while fragments arrive quickly
 
 ## [8.2.8] - 2026-06-30
 
