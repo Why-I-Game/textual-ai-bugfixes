@@ -80,8 +80,12 @@ class StreamLayout(Layout):
             top, right, bottom, left = margin
             y += top if top > previous_margin else previous_margin
             previous_margin = bottom
+            # Measure at the width the widget is placed with below (margins removed),
+            # or wrapped text can need more lines than the height allows.
             height = (
-                widget.get_content_height(size, viewport, width - gutter_width)
+                widget.get_content_height(
+                    size, viewport, width - (left + right) - gutter_width
+                )
                 + gutter_height
             )
             if (max_height := styles.max_height) is not None and max_height.is_cells:
