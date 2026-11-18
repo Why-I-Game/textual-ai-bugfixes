@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import weakref
 from contextlib import suppress
 from functools import partial
@@ -92,6 +93,29 @@ class MarkdownStream:
         # Allow the task to wake up and actually display the new markdown
         await asyncio.sleep(0)
 
+    REST_RATIO = 2.0
+    """Rest this many times as long as an append and its screen refresh took."""
+    MAX_REST = 0.3
+    """Longest rest, in seconds."""
+
+    async def _rest(self, started: float) -> None:
+        """Let the app lay out, paint and handle input before the next append.
+
+        Without this, fragments that arrive faster than the app can lay them out make it
+        lay out the growing document again and again with no idle time: keys wait and
+        are lost. Fragments arriving meanwhile are joined into the next append, so the
+        final text is the same.
+
+        Args:
+            started: The `time.monotonic()` value from before the append.
+        """
+        try:
+            await asyncio.wait_for(self.markdown_widget.wait_for_refresh(), 1.0)
+        except (asyncio.TimeoutError, AssertionError):
+            pass
+        busy = time.monotonic() - started
+        await asyncio.sleep(min(self.MAX_REST, busy * self.REST_RATIO))
+
     async def _run(self) -> None:
         """Run a task to append markdown fragments when available."""
         try:
@@ -99,7 +123,9 @@ class MarkdownStream:
                 new_markdown = "".join(self._pending)
                 self._pending.clear()
                 self._new_markup.clear()
+                started = time.monotonic()
                 await asyncio.shield(self.markdown_widget.append(new_markdown))
+                await self._rest(started)
         except asyncio.CancelledError:
             # Task has been cancelled, add any outstanding markdown
             pass

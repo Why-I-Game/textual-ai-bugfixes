@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- `MarkdownStream` now rests after each append, so the app can lay out and handle input while fragments arrive quickly
+
 ## [8.2.8] - 2026-06-30
 
 ### Fixed
