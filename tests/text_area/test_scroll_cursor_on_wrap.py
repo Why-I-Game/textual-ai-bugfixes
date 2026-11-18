@@ -5,7 +5,7 @@ from textual.widgets import TextArea
 async def test_cursor_visible_when_typing_wraps_a_scrolled_text_area():
     """Typing that wraps onto a new visual line must scroll the cursor into view.
 
-    Regression test for https://github.com/Textualize/textual/issues/<number>
+    Regression test for https://github.com/Textualize/textual/issues/6795
     """
 
     class WrapApp(App):
