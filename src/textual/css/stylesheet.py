@@ -19,7 +19,7 @@ from textual.css.errors import StylesheetError
 from textual.css.match import _check_selectors
 from textual.css.model import RuleSet
 from textual.css.parse import parse
-from textual.css.styles import RulesMap, Styles
+from textual.css.styles import RulesMap, Styles, batch_refreshes
 from textual.css.tokenize import Token, tokenize_values
 from textual.css.tokenizer import TokenError
 from textual.css.types import CSSLocation, Specificity3, Specificity6
@@ -720,18 +720,20 @@ class Stylesheet:
         cache: dict[tuple, RulesMap] = {}
         apply = self.apply
 
-        for node in nodes:
-            apply(node, animate=animate, cache=cache)
-            if isinstance(node, Widget) and node.is_scrollable:
-                show_vertical_scrollbar = (
-                    node.show_vertical_scrollbar and node.scrollbar_size_vertical
-                )
-                show_horizontal_scrollbar = (
-                    node.show_horizontal_scrollbar and node.scrollbar_size_horizontal
-                )
-                if show_vertical_scrollbar:
-                    apply(node.vertical_scrollbar, cache=cache)
-                if show_horizontal_scrollbar:
-                    apply(node.horizontal_scrollbar, cache=cache)
-                if show_horizontal_scrollbar and show_vertical_scrollbar:
-                    apply(node.scrollbar_corner, cache=cache)
+        with batch_refreshes():
+            for node in nodes:
+                apply(node, animate=animate, cache=cache)
+                if isinstance(node, Widget) and node.is_scrollable:
+                    show_vertical_scrollbar = (
+                        node.show_vertical_scrollbar and node.scrollbar_size_vertical
+                    )
+                    show_horizontal_scrollbar = (
+                        node.show_horizontal_scrollbar
+                        and node.scrollbar_size_horizontal
+                    )
+                    if show_vertical_scrollbar:
+                        apply(node.vertical_scrollbar, cache=cache)
+                    if show_horizontal_scrollbar:
+                        apply(node.horizontal_scrollbar, cache=cache)
+                    if show_horizontal_scrollbar and show_vertical_scrollbar:
+                        apply(node.scrollbar_corner, cache=cache)

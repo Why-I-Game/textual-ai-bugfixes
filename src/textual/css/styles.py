@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import weakref
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import partial
 from operator import attrgetter
@@ -83,6 +85,60 @@ if TYPE_CHECKING:
     from textual.css.types import CSSLocation
     from textual.dom import DOMNode
     from textual.layout import Layout
+
+
+class _RefreshBatch:
+    """Node refreshes collected while a stylesheet restyles many nodes.
+
+    A theme change sets about ten colour rules on every widget, and each one
+    refreshed the widget's whole subtree: quadratic in the DOM size, seconds of
+    frozen app in a long conversation. Collected here, each node refreshes once.
+    """
+
+    def __init__(self) -> None:
+        # Node -> [layout, repaint], for the node itself and for its descendants.
+        self.nodes: dict[DOMNode, list[bool]] = {}
+        self.children: dict[DOMNode, list[bool]] = {}
+
+    @staticmethod
+    def add(
+        table: dict[DOMNode, list[bool]], node: DOMNode, layout: bool, repaint: bool
+    ) -> None:
+        flags = table.get(node)
+        if flags is None:
+            table[node] = [layout, repaint]
+        else:
+            flags[0] = flags[0] or layout
+            flags[1] = flags[1] or repaint
+
+    def flush(self) -> None:
+        nodes = self.nodes
+        for parent, (layout, repaint) in self.children.items():
+            for child in parent.walk_children(with_self=False, reverse=True):
+                self.add(nodes, child, layout, repaint)
+        for node, (layout, repaint) in nodes.items():
+            if node._is_mounted:
+                node.refresh(layout=layout, repaint=repaint)
+
+
+_refresh_batch: ContextVar[_RefreshBatch | None] = ContextVar(
+    "_refresh_batch", default=None
+)
+
+
+@contextmanager
+def batch_refreshes() -> Iterator[None]:
+    """Collect style refreshes made inside, and refresh each node once on exit."""
+    if _refresh_batch.get() is not None:
+        yield
+        return
+    batch = _RefreshBatch()
+    token = _refresh_batch.set(batch)
+    try:
+        yield
+    finally:
+        _refresh_batch.reset(token)
+        batch.flush()
 
 
 class RulesMap(TypedDict, total=False):
@@ -951,6 +1007,16 @@ class Styles(StylesBase):
     ) -> None:
         node = self.node
         if node is None or not node._is_mounted:
+            return
+        batch = _refresh_batch.get()
+        if batch is not None:
+            # Restyling many nodes at once (Stylesheet.update_nodes): refresh each
+            # node once at the end, rather than its whole subtree per changed rule.
+            if parent and node._parent is not None:
+                batch.add(batch.nodes, node._parent, False, repaint)
+            batch.add(batch.nodes, node, layout, True)
+            if children:
+                batch.add(batch.children, node, layout, repaint)
             return
         if parent and node._parent is not None:
             node._parent.refresh(repaint=repaint)

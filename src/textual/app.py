@@ -3813,10 +3813,60 @@ class App(Generic[ReturnType], DOMNode):
         # The other screens in the stack will need to know about some style
         # changes, as a final pass let's check in on every screen that isn't
         # the current one and update them too.
-        for screen in self.screen_stack:
-            if screen != self.screen:
-                stylesheet.update(screen, animate=animate)
-                screen._css_update_count = self._css_update_count
+        # Those seen behind the current one (e.g. behind a modal) restyle their
+        # visible widgets first, so they repaint at once; the rest of each, often
+        # far more nodes (a long conversation scrolled out of view), follows
+        # after that repaint.
+        background = [screen for screen in self.screen_stack if screen != self.screen]
+        if not background:
+            return
+        done: set[DOMNode] = set()
+        for screen in background:
+            visible = screen._compositor.visible_widgets
+            if not visible:
+                continue
+            nodes = [
+                node
+                for node in screen.walk_children(with_self=True)
+                if node is screen or node in visible
+            ]
+            stylesheet.update_nodes(nodes, animate=animate)
+            done.update(nodes)
+        self.set_timer(
+            0.1,
+            partial(
+                self._refresh_background_css,
+                background,
+                done,
+                self._css_update_count,
+                animate,
+            ),
+        )
+
+    def _refresh_background_css(
+        self,
+        screens: list[Screen],
+        done: set[DOMNode],
+        css_update_count: int,
+        animate: bool,
+    ) -> None:
+        """Restyle the rest of the background screens (see `refresh_css`)."""
+        if css_update_count != self._css_update_count:
+            # A later refresh_css restyles them again.
+            return
+        stylesheet = self.stylesheet
+        for screen in screens:
+            if not screen.is_attached:
+                continue
+            stylesheet.update_nodes(
+                [
+                    node
+                    for node in screen.walk_children(with_self=True)
+                    if node not in done
+                ],
+                animate=animate,
+            )
+            screen._css_update_count = self._css_update_count
 
     def _display(self, screen: Screen, renderable: RenderableType | None) -> None:
         """Display a renderable within a sync.
