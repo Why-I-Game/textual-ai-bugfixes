@@ -1696,11 +1696,14 @@ TextArea {
                 result.end_location,
             )
 
+        # Update the virtual size before edit.after moves the cursor: moving it scrolls
+        # to the cursor, which is clamped to the old scroll limit if the edit wrapped
+        # onto a new line.
+        self._refresh_size()
         edit.after(self)
         self._build_highlight_map()
         self.post_message(self.Changed(self))
         self.update_suggestion()
-        self._refresh_size()
         return result
 
     def undo(self) -> None:
