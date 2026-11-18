@@ -22,7 +22,7 @@ def scrollbar_column(app: App) -> list:
 
 
 async def test_anchored_scrollbar_repainted_after_resize():
-    """An anchored container moved to its new end by a resize must repaint its
+    """An anchored container scrolled to its new bottom by a resize must repaint its
     scrollbar, or the thumb stays where it was drawn at the old size.
 
     Regression test for https://github.com/Textualize/textual/issues/<number>
